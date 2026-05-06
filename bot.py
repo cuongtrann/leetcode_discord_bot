@@ -74,10 +74,10 @@ def yesterday_str() -> str:
     return (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # ─── LEETCODE API ─────────────────────────────────────────────────────────────
-async def fetch_lc_submissions(username: str) -> list | None:
+async def fetch_lc_submissions(username: str, limit: int = 20) -> list | None:
     payload = {
         "query": LEETCODE_RECENT_QUERY,
-        "variables": {"username": username, "limit": 20}
+        "variables": {"username": username, "limit": limit}
     }
     headers = {
         "Content-Type": "application/json",
@@ -114,6 +114,33 @@ async def verify_today(username: str, min_p: int = 1) -> tuple[bool, list[str]]:
 
     return len(done) >= min_p, done
 
+async def fetch_recent_daily_ac(username: str, days: int = 30) -> dict[str, list[str]]:
+    """Builds YYYY-MM-DD -> unique accepted problem titles from recent AC list."""
+    subs = await fetch_lc_submissions(username, limit=200)
+    if subs is None:
+        return {}
+
+    today = datetime.now(TIMEZONE).date()
+    earliest = today - timedelta(days=days - 1)
+    daily: dict[str, dict[str, str]] = {}
+
+    for sub in subs:
+        ts = int(sub.get("timestamp", 0))
+        if ts <= 0:
+            continue
+        solved_date = datetime.fromtimestamp(ts, tz=TIMEZONE).date()
+        if solved_date < earliest or solved_date > today:
+            continue
+        day_key = solved_date.strftime("%Y-%m-%d")
+        slug = sub.get("titleSlug", "")
+        title = sub.get("title", slug)
+        if not slug:
+            continue
+        daily.setdefault(day_key, {})
+        daily[day_key][slug] = title
+
+    return {d: list(slug_map.values()) for d, slug_map in daily.items()}
+
 # ─── STREAK HELPERS ───────────────────────────────────────────────────────────
 def update_streak(gd: dict, uid: str, completed: bool) -> dict:
     streaks = gd.setdefault("streaks", {})
@@ -144,6 +171,49 @@ def streak_emoji(n: int) -> str:
     if n >= 7:  return "⚡"
     if n >= 3:  return "✨"
     return "🌱"
+
+def recalc_streak_for_user(gd: dict, uid: str) -> dict:
+    """Rebuild streak from stored submissions for one user."""
+    streaks = gd.setdefault("streaks", {})
+    solved_dates = []
+    for day, users in gd.get("submissions", {}).items():
+        if uid in users:
+            solved_dates.append(day)
+
+    if not solved_dates:
+        streaks[uid] = {"current": 0, "best": 0, "last_date": None}
+        return streaks[uid]
+
+    solved_dates = sorted(set(solved_dates))
+    best = cur_run = 1
+    for i in range(1, len(solved_dates)):
+        prev = datetime.strptime(solved_dates[i - 1], "%Y-%m-%d").date()
+        cur = datetime.strptime(solved_dates[i], "%Y-%m-%d").date()
+        if (cur - prev).days == 1:
+            cur_run += 1
+            best = max(best, cur_run)
+        else:
+            cur_run = 1
+
+    last_date = solved_dates[-1]
+    last_dt = datetime.strptime(last_date, "%Y-%m-%d").date()
+    today = datetime.now(TIMEZONE).date()
+    yesterday = today - timedelta(days=1)
+    current = 0
+    if last_dt in (today, yesterday):
+        current = 1
+        idx = len(solved_dates) - 1
+        while idx > 0:
+            d1 = datetime.strptime(solved_dates[idx], "%Y-%m-%d").date()
+            d0 = datetime.strptime(solved_dates[idx - 1], "%Y-%m-%d").date()
+            if (d1 - d0).days == 1:
+                current += 1
+                idx -= 1
+            else:
+                break
+
+    streaks[uid] = {"current": current, "best": best, "last_date": last_date}
+    return streaks[uid]
 
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
 @bot.event
@@ -294,6 +364,61 @@ async def check(interaction: discord.Interaction):
             embed.add_field(name="Đã làm", value="\n".join(f"• {p}" for p in problems), inline=False)
         embed.set_footer(text=f"Cần {min_p - solved} bài nữa!")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+@tree.command(name="sync_history", description="Đồng bộ lịch sử gần đây từ LeetCode để sửa streak bị lệch")
+@app_commands.describe(days="Số ngày gần đây cần đồng bộ (1-90)")
+async def sync_history(
+    interaction: discord.Interaction,
+    days: app_commands.Range[int, 1, 90] = 30
+):
+    await interaction.response.defer(ephemeral=True)
+    gd = get_guild_data(interaction.guild_id)
+    uid = str(interaction.user.id)
+    username = gd["leetcode_usernames"].get(uid)
+    if not username:
+        await interaction.followup.send(
+            "⚠️ Bạn chưa đăng ký. Dùng `/register <username>` trước nhé!",
+            ephemeral=True
+        )
+        return
+
+    daily = await fetch_recent_daily_ac(username, days=days)
+    if not daily:
+        await interaction.followup.send(
+            "❌ Không lấy được lịch sử từ LeetCode hoặc không có AC gần đây.",
+            ephemeral=True
+        )
+        return
+
+    today = datetime.now(TIMEZONE).date()
+    range_days = {
+        (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(days)
+    }
+    min_p = gd.get("min_problems", 1)
+    gd.setdefault("submissions", {})
+
+    updated_days = 0
+    for day in sorted(range_days):
+        titles = daily.get(day, [])
+        users_for_day = gd["submissions"].setdefault(day, {})
+        if len(titles) >= min_p:
+            users_for_day[uid] = titles
+            updated_days += 1
+        elif uid in users_for_day:
+            del users_for_day[uid]
+            if not users_for_day:
+                del gd["submissions"][day]
+
+    s = recalc_streak_for_user(gd, uid)
+    update_guild_data(interaction.guild_id, gd)
+
+    await interaction.followup.send(
+        f"✅ Đã đồng bộ **{days} ngày** cho **{username}**.\n"
+        f"📅 Ngày đạt mục tiêu sau sync: **{updated_days}** ngày\n"
+        f"🔥 Streak hiện tại: **{s['current']}** | 🏆 Kỷ lục: **{s['best']}**",
+        ephemeral=True
+    )
 
 @tree.command(name="status", description="Xem tiến độ hôm nay của cả nhóm")
 async def status(interaction: discord.Interaction):
