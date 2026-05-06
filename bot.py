@@ -26,6 +26,17 @@ query recentAcSubmissions($username: String!, $limit: Int!) {
   }
 }
 """
+LEETCODE_CALENDAR_QUERY = """
+query userProfileCalendar($username: String!, $year: Int) {
+  matchedUser(username: $username) {
+    userCalendar(year: $year) {
+      activeYears
+      streak
+      submissionCalendar
+    }
+  }
+}
+"""
 
 # ─── BOT SETUP ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -140,6 +151,57 @@ async def fetch_recent_daily_ac(username: str, days: int = 30) -> dict[str, list
         daily[day_key][slug] = title
 
     return {d: list(slug_map.values()) for d, slug_map in daily.items()}
+
+async def fetch_calendar_submissions(username: str) -> tuple[dict[str, int], int | None]:
+    """Returns (YYYY-MM-DD -> submission_count, reported_streak)."""
+    payload = {
+        "query": LEETCODE_CALENDAR_QUERY,
+        "variables": {"username": username, "year": None}
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": "https://leetcode.com",
+        "User-Agent": "Mozilla/5.0"
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                LEETCODE_API,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
+                    return {}, None
+                data = await r.json()
+    except Exception:
+        return {}, None
+
+    cal = (
+        data.get("data", {})
+        .get("matchedUser", {})
+        .get("userCalendar", {})
+    )
+    streak = cal.get("streak")
+    raw = cal.get("submissionCalendar")
+    if not raw:
+        return {}, streak
+
+    try:
+        epoch_map = json.loads(raw)
+    except Exception:
+        return {}, streak
+
+    by_day: dict[str, int] = {}
+    for epoch_str, count in epoch_map.items():
+        try:
+            ts = int(epoch_str)
+            n = int(count)
+        except (ValueError, TypeError):
+            continue
+        day = datetime.fromtimestamp(ts, tz=TIMEZONE).strftime("%Y-%m-%d")
+        by_day[day] = n
+    return by_day, streak
 
 # ─── STREAK HELPERS ───────────────────────────────────────────────────────────
 def update_streak(gd: dict, uid: str, completed: bool) -> dict:
@@ -382,10 +444,10 @@ async def sync_history(
         )
         return
 
-    daily = await fetch_recent_daily_ac(username, days=days)
-    if not daily:
+    daily_counts, lc_streak = await fetch_calendar_submissions(username)
+    if not daily_counts:
         await interaction.followup.send(
-            "❌ Không lấy được lịch sử từ LeetCode hoặc không có AC gần đây.",
+            "❌ Không lấy được calendar từ LeetCode. Thử lại sau.",
             ephemeral=True
         )
         return
@@ -400,10 +462,16 @@ async def sync_history(
 
     updated_days = 0
     for day in sorted(range_days):
-        titles = daily.get(day, [])
+        count = daily_counts.get(day, 0)
         users_for_day = gd["submissions"].setdefault(day, {})
-        if len(titles) >= min_p:
-            users_for_day[uid] = titles
+        if count >= min_p:
+            # userCalendar only returns counts, not solved-title list.
+            # Keep existing detailed titles when available.
+            existing = users_for_day.get(uid, [])
+            if existing:
+                users_for_day[uid] = existing
+            else:
+                users_for_day[uid] = [f"[sync] {count} submissions from LeetCode calendar"]
             updated_days += 1
         elif uid in users_for_day:
             del users_for_day[uid]
@@ -416,7 +484,8 @@ async def sync_history(
     await interaction.followup.send(
         f"✅ Đã đồng bộ **{days} ngày** cho **{username}**.\n"
         f"📅 Ngày đạt mục tiêu sau sync: **{updated_days}** ngày\n"
-        f"🔥 Streak hiện tại: **{s['current']}** | 🏆 Kỷ lục: **{s['best']}**",
+        f"🔥 Streak hiện tại: **{s['current']}** | 🏆 Kỷ lục: **{s['best']}**\n"
+        f"📌 LeetCode calendar streak báo: **{lc_streak if lc_streak is not None else 'N/A'}**",
         ephemeral=True
     )
 
